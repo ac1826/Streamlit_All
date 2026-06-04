@@ -3625,6 +3625,7 @@ def build_overview_table_for_day(
 
 # ===== UI =====
 st.sidebar.header("数据源（请上传）")
+st.sidebar.markdown("上传文件")
 prod_upload = st.sidebar.file_uploader("产量", type=["xlsx","xls"])
 external_proc_upload = st.sidebar.file_uploader("外采加工产量（仅产销率）", type=["xlsx","xls"], accept_multiple_files=True)
 sale_upload = st.sidebar.file_uploader("销量", type=["xlsx","xls"], accept_multiple_files=True)
