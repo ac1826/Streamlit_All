@@ -1,0 +1,17 @@
+.codex_logs/
+logs/
+streamlit_logs/
+__pycache__/
+tests/__pycache__/
+
+*.log
+*.pyc
+*.tmp
+~$*
+
+tmp_*.xlsx
+输出/
+
+assets/
+app_streamlit.py.bak_*
+app_streamlit_city_kpi.py
