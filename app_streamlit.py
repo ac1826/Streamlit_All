@@ -1133,6 +1133,46 @@ def _apply_row_min_max_highlight(ws, col_start, col_end, data_start_row, data_en
                 cell.fill = min_fill
 
 
+def _get_valid_liveweight_days(df_lw):
+    if df_lw is None or getattr(df_lw, "empty", True):
+        return set()
+    out = df_lw.copy()
+    dcol = next((c for c in ["日期","交鸡日期","记帐日期","记账日期","凭证日期","过账日期"] if c in out.columns), None)
+    wcol = next((c for c in ["毛鸡净重(kg)","毛鸡净重","净重","净重(kg)"] if c in out.columns), None)
+    if not (dcol and wcol):
+        return set()
+    out = out[[dcol, wcol]].copy()
+    out.columns = ["日期", "毛鸡净重(kg)"]
+    out["日期"] = pd.to_datetime(out["日期"], errors="coerce").dt.normalize()
+    out["毛鸡净重(kg)"] = pd.to_numeric(out["毛鸡净重(kg)"], errors="coerce")
+    out = out.dropna(subset=["日期", "毛鸡净重(kg)"])
+    if out.empty:
+        return set()
+    day_sum = out.groupby("日期", as_index=False)["毛鸡净重(kg)"].sum(min_count=1)
+    return set(day_sum.loc[day_sum["毛鸡净重(kg)"] > 0, "日期"].tolist())
+
+
+def _mark_trend_missing_liveweight_days(df, day_dates, df_lw):
+    if df is None or getattr(df, "empty", True):
+        return df
+    out = df.copy()
+    valid_days = _get_valid_liveweight_days(df_lw)
+    if not valid_days:
+        return out
+    for idx, day in enumerate(day_dates, start=2):
+        day_ts = pd.to_datetime(day, errors="coerce")
+        if pd.isna(day_ts):
+            continue
+        if day_ts.normalize() in valid_days:
+            continue
+        if idx >= len(out.columns) + 1:
+            continue
+        col_name = out.columns[idx - 1]
+        out[col_name] = out[col_name].astype(object)
+        out.iloc[:, idx - 1] = "—"
+    return out
+
+
 def _get_or_create_writer_sheet(writer, sheet_name):
     ws = writer.sheets.get(sheet_name)
     if ws is not None:
@@ -4993,6 +5033,8 @@ try:
 
                         trend_price = price_pivot.reset_index().rename(columns={"项目":"含税单价"})
                         trend_rate = rate_pivot.reset_index().rename(columns={"项目":"产成率"})
+                        trend_price = _mark_trend_missing_liveweight_days(trend_price, days_in_range, df_lw)
+                        trend_rate = _mark_trend_missing_liveweight_days(trend_rate, days_in_range, df_lw)
 
             if (trend_price is not None and not trend_price.empty) or (trend_rate is not None and not trend_rate.empty):
                 trend_sheet = "本月趋势"
