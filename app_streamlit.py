@@ -3206,18 +3206,80 @@ def _build_restore_rate_dict(ov_slice, lw_value):
     }
 
 
-def _calc_restore_maps_for_day(overview, minors, df_lw, day_value, restore_mapping):
+def _build_restore_period_weight_dict(overview, start, end):
+    if overview is None or getattr(overview, "empty", True):
+        return {}
+    try:
+        dates = pd.to_datetime(overview["\u65e5\u671f"], errors="coerce").dt.normalize()
+        scope = overview.loc[(dates >= start) & (dates <= end), ["\u9879\u76ee", "\u4ea7\u91cf(kg)"]].copy()
+        if scope.empty:
+            return {}
+        scope["\u9879\u76ee"] = scope["\u9879\u76ee"].map(_unify_restore_part)
+        scope["\u4ea7\u91cf(kg)"] = pd.to_numeric(scope["\u4ea7\u91cf(kg)"], errors="coerce")
+        weights = scope.groupby("\u9879\u76ee", as_index=False)["\u4ea7\u91cf(kg)"].sum(min_count=1)
+        return {
+            str(row["\u9879\u76ee"]).strip(): float(row["\u4ea7\u91cf(kg)"])
+            for _, row in weights.iterrows()
+            if pd.notna(row["\u4ea7\u91cf(kg)"]) and float(row["\u4ea7\u91cf(kg)"]) > 0
+        }
+    except Exception:
+        return {}
+
+
+def _build_nearest_valid_restore_weight_dict(overview, df_lw, day_value, start, end):
+    if overview is None or getattr(overview, "empty", True):
+        return {}
+    try:
+        dates = pd.to_datetime(overview["\u65e5\u671f"], errors="coerce").dropna().dt.normalize().unique()
+        candidates = [
+            pd.Timestamp(d).normalize()
+            for d in dates
+            if pd.Timestamp(d).normalize() >= start and pd.Timestamp(d).normalize() <= end
+            and pd.notna(_restore_lw_on(df_lw, pd.Timestamp(d).normalize()))
+            and float(_restore_lw_on(df_lw, pd.Timestamp(d).normalize())) > 0
+        ]
+        candidates.sort(key=lambda d: (abs((d - day_value).days), d > day_value, d))
+        if not candidates:
+            return {}
+        nearest = candidates[0]
+        return _build_restore_period_weight_dict(overview, nearest, nearest)
+    except Exception:
+        return {}
+
+
+def _select_restore_weight_dict(targets, *weight_candidates):
+    for weights in weight_candidates:
+        if not weights:
+            continue
+        valid_targets = [t for t in targets if float(weights.get(t, 0.0)) > 0]
+        if valid_targets:
+            return weights, valid_targets
+    return {}, []
+
+
+def _calc_restore_maps_for_day(
+    overview,
+    minors,
+    df_lw,
+    day_value,
+    restore_mapping,
+    missing_lw_whole_chicken_weights=None,
+    nearest_valid_weights=None,
+):
     ov_day = overview[overview["\u65e5\u671f"] == day_value][["\u9879\u76ee", "\u4ea7\u91cf(kg)", "\u542b\u7a0e\u91d1\u989d", "\u542b\u7a0e\u5355\u4ef7"]].copy()
     if ov_day.empty:
         return {}, {}, float("nan"), ov_day
     ov_day["\u9879\u76ee"] = ov_day["\u9879\u76ee"].map(_unify_restore_part)
 
     lw_day = _restore_lw_on(df_lw, day_value)
-    if not (pd.notna(lw_day) and float(lw_day) > 0):
+    has_valid_lw = pd.notna(lw_day) and float(lw_day) > 0
+    if not has_valid_lw and not (missing_lw_whole_chicken_weights or nearest_valid_weights):
         return {}, {}, lw_day, ov_day
 
-    rate_dict = _build_restore_rate_dict(ov_day, lw_day)
-    if not rate_dict or minors is None or minors.empty or not restore_mapping:
+    rate_dict = _build_restore_rate_dict(ov_day, lw_day) if has_valid_lw else {}
+    if has_valid_lw and not rate_dict:
+        return {}, {}, lw_day, ov_day
+    if minors is None or minors.empty or not restore_mapping:
         return {}, {}, lw_day, ov_day
 
     try:
@@ -3249,13 +3311,19 @@ def _calc_restore_maps_for_day(overview, minors, df_lw, day_value, restore_mappi
         qty = float(row["\u4ea7\u91cf(kg)"]) if pd.notna(row["\u4ea7\u91cf(kg)"]) else 0.0
         if qty == 0:
             continue
+        if not has_valid_lw and restore_part != "\u6574\u9e21\u7c7b":
+            continue
         normed_code = normalize_code([code_raw])
         canon_code = normed_code[0] if normed_code else str(code_raw).strip()
         targets_raw = restore_mapping.get(canon_code, [])
         if not targets_raw:
             continue
         targets = [_unify_restore_part(t) for t in targets_raw if t]
-        valid_targets = [t for t in targets if rate_dict.get(t, 0) > 0]
+        weights, valid_targets = _select_restore_weight_dict(
+            targets,
+            rate_dict if has_valid_lw else missing_lw_whole_chicken_weights,
+            nearest_valid_weights if not has_valid_lw else None,
+        )
         if not valid_targets:
             continue
         code_qty[canon_code] = code_qty.get(canon_code, 0.0) + qty
@@ -3263,7 +3331,7 @@ def _calc_restore_maps_for_day(overview, minors, df_lw, day_value, restore_mappi
 
     bone_rate_total = 0.0
     for code_k, qty_k in code_qty.items():
-        if code_part.get(code_k) == "\u9aa8\u67b6\u7c7b" and qty_k:
+        if has_valid_lw and code_part.get(code_k) == "\u9aa8\u67b6\u7c7b" and qty_k:
             bone_rate_total += qty_k / lw_day
 
     inc_map = {}
@@ -3274,22 +3342,28 @@ def _calc_restore_maps_for_day(overview, minors, df_lw, day_value, restore_mappi
         qty = float(row["\u4ea7\u91cf(kg)"]) if pd.notna(row["\u4ea7\u91cf(kg)"]) else 0.0
         if qty == 0:
             continue
+        if not has_valid_lw and restore_part != "\u6574\u9e21\u7c7b":
+            continue
         normed_code = normalize_code([code_raw])
         canon_code = normed_code[0] if normed_code else str(code_raw).strip()
         targets_raw = restore_mapping.get(canon_code, [])
         if not targets_raw:
             continue
         targets = [_unify_restore_part(t) for t in targets_raw if t]
-        valid_targets = [t for t in targets if rate_dict.get(t, 0) > 0]
+        weights, valid_targets = _select_restore_weight_dict(
+            targets,
+            rate_dict if has_valid_lw else missing_lw_whole_chicken_weights,
+            nearest_valid_weights if not has_valid_lw else None,
+        )
         if not valid_targets:
             continue
 
         use_bone_rule = (restore_part == "\u9aa8\u67b6\u7c7b")
-        sum_target_rates = sum(rate_dict[t] for t in valid_targets)
+        sum_target_rates = sum(weights[t] for t in valid_targets)
         if use_bone_rule:
             adj_rates = {}
             for t in valid_targets:
-                adj_rate = rate_dict[t]
+                adj_rate = weights[t]
                 if t == "\u9aa8\u67b6\u7c7b":
                     adj_rate = adj_rate - bone_rate_total
                 if adj_rate > 0:
@@ -3309,7 +3383,7 @@ def _calc_restore_maps_for_day(overview, minors, df_lw, day_value, restore_mappi
         removed_map[restore_part] = removed_map.get(restore_part, 0.0) + qty
         base_qty = qty / sum_target_rates
         for t in valid_targets:
-            rate_val = rate_dict[t]
+            rate_val = weights[t]
             inc = base_qty * rate_val
             inc_map[t] = inc_map.get(t, 0.0) + inc
 
@@ -3330,7 +3404,15 @@ def _combine_restored_qty_map(qty_map):
     return out
 
 
-def _compute_restored_main_side_qty_amt_for_period(overview, minors, df_lw, restore_mapping, start, end):
+def _compute_restored_main_side_qty_amt_for_period(
+    overview,
+    minors,
+    df_lw,
+    restore_mapping,
+    start,
+    end,
+    allow_missing_lw_whole_chicken=False,
+):
     if overview is None or overview.empty:
         return np.nan, np.nan, np.nan, np.nan
 
@@ -3364,9 +3446,28 @@ def _compute_restored_main_side_qty_amt_for_period(overview, minors, df_lw, rest
         amt_map[proj] = amt
         unit_map[proj] = (amt / qty) if qty != 0 else np.nan
 
+    period_weights = (
+        _build_restore_period_weight_dict(overview, start, end)
+        if allow_missing_lw_whole_chicken
+        else {}
+    )
     delta_acc = {}
     for day_value in sorted(base_scope["日期"].dropna().unique()):
-        inc_map, removed_map, _, ov_day = _calc_restore_maps_for_day(overview, minors, df_lw, day_value, restore_mapping)
+        day_ts = pd.Timestamp(day_value).normalize()
+        nearest_weights = (
+            _build_nearest_valid_restore_weight_dict(overview, df_lw, day_ts, start, end)
+            if allow_missing_lw_whole_chicken
+            else {}
+        )
+        inc_map, removed_map, _, ov_day = _calc_restore_maps_for_day(
+            overview,
+            minors,
+            df_lw,
+            day_ts,
+            restore_mapping,
+            missing_lw_whole_chicken_weights=period_weights,
+            nearest_valid_weights=nearest_weights,
+        )
         if ov_day is None or ov_day.empty:
             continue
         for proj in (set(inc_map) | set(removed_map)):
@@ -3421,6 +3522,7 @@ def _build_main_side_rows(
     restore_mapping=None,
     start=None,
     end=None,
+    allow_missing_lw_whole_chicken=False,
 ):
     columns = ["项目", "产量(kg)", "销量(kg)", "产成率%", "含税金额", "含税单价"]
     if seg is None or seg.empty:
@@ -3457,7 +3559,13 @@ def _build_main_side_rows(
     ):
         restored_main_qty, restored_main_amt, restored_side_qty, restored_side_amt = (
             _compute_restored_main_side_qty_amt_for_period(
-                overview_all, minors, df_lw, restore_mapping, start, end
+                overview_all,
+                minors,
+                df_lw,
+                restore_mapping,
+                start,
+                end,
+                allow_missing_lw_whole_chicken=allow_missing_lw_whole_chicken,
             )
         )
 
@@ -3829,7 +3937,7 @@ else:
 
         restore_mapping_state = read_restore_mapping_upload(st.session_state.get("restore_mapping_file"))
 
-        def _summary_row(label, start, end):
+        def _summary_row(label, start, end, allow_missing_lw_whole_chicken=False):
             empty_row = {
                 "\u65e5\u671f": label,
                 "\u4ea7\u6210\u7387(%)": np.nan,
@@ -3882,6 +3990,7 @@ else:
                 restore_mapping=restore_mapping_state,
                 start=start,
                 end=end,
+                allow_missing_lw_whole_chicken=allow_missing_lw_whole_chicken,
             )
 
             def _row_value(item_name, col_name):
@@ -3918,8 +4027,18 @@ else:
 
         summary_rows = [
             _summary_row(f"{sel_dt.month}月{sel_dt.day}日", sel_dt, sel_dt),
-            _summary_row(f"{sel_dt.month}月累计", month_start, sel_dt),
-            _summary_row(f"{prev_month_start.month}月全月累计", prev_month_start, prev_month_end)
+            _summary_row(
+                f"{sel_dt.month}月累计",
+                month_start,
+                sel_dt,
+                allow_missing_lw_whole_chicken=True,
+            ),
+            _summary_row(
+                f"{prev_month_start.month}月全月累计",
+                prev_month_start,
+                prev_month_end,
+                allow_missing_lw_whole_chicken=True,
+            )
         ]
         summary_df = pd.DataFrame(summary_rows)
         summary_order = [
@@ -4205,6 +4324,7 @@ else:
             restore_mapping=restore_mapping_state,
             start=month_start,
             end=sel_dt,
+            allow_missing_lw_whole_chicken=True,
         )
         total_row = pd.DataFrame({"项目":["总计"],                               "产量(kg)":[float(tot_qty) if pd.notna(tot_qty) else 0.0],                               "销量(kg)":[float(tot_sale) if pd.notna(tot_sale) else 0.0],                               "含税金额":[float(tot_amt) if pd.notna(tot_amt) else 0.0],                               "含税单价":[float(tot_unit)]})
         cum_final = pd.concat([cum_base, main_side_rows, total_row], ignore_index=True)
@@ -4656,16 +4776,23 @@ try:
             return {row["项目"]: row["产成率(小数)"] for _, row in rate_df.iterrows()
                     if pd.notna(row["产成率(小数)"]) and row["产成率(小数)"] > 0}
 
-        def _calc_for_day(day_value, need_detail=False):
+        def _calc_for_day(
+            day_value,
+            need_detail=False,
+            allow_missing_lw_whole_chicken=False,
+            missing_lw_whole_chicken_weights=None,
+            nearest_valid_weights=None,
+        ):
             ov_day = overview[overview["日期"] == day_value][["项目","产量(kg)","含税金额","含税单价"]].copy()
             if ov_day.empty:
                 return {}, {}, [], float("nan"), ov_day, []
             ov_day["项目"] = ov_day["项目"].map(_unify)
             lw_day = _lw_on(day_value)
-            if not (pd.notna(lw_day) and float(lw_day) > 0):
+            has_valid_lw = pd.notna(lw_day) and float(lw_day) > 0
+            if not has_valid_lw and not allow_missing_lw_whole_chicken:
                 return {}, {}, [], lw_day, ov_day, []
-            rate_dict = _build_rate_dict(ov_day, lw_day)
-            if not rate_dict:
+            rate_dict = _build_rate_dict(ov_day, lw_day) if has_valid_lw else {}
+            if has_valid_lw and not rate_dict:
                 return {}, {}, [], lw_day, ov_day, []
 
             minors_day = pd.DataFrame()
@@ -4698,43 +4825,58 @@ try:
                 qty = float(row["产量(kg)"]) if pd.notna(row["产量(kg)"]) else 0.0
                 if qty == 0:
                     continue
+                if not has_valid_lw and restore_part != "整鸡类":
+                    continue
                 canon_code = _canon_code_val(code_raw)
                 targets_raw = restore_mapping.get(canon_code, [])
                 if not targets_raw:
                     continue
                 targets = [_unify(t) for t in targets_raw if t]
-                valid_targets = [t for t in targets if rate_dict.get(t, 0) > 0]
+                weights, valid_targets = _select_restore_weight_dict(
+                    targets,
+                    rate_dict if has_valid_lw else missing_lw_whole_chicken_weights,
+                    nearest_valid_weights if not has_valid_lw else None,
+                )
                 if not valid_targets:
                     continue
                 code_qty[canon_code] = code_qty.get(canon_code, 0.0) + qty
                 code_part[canon_code] = restore_part
             bone_rate_total = 0.0
             for code_k, qty_k in code_qty.items():
-                if code_part.get(code_k) == "骨架类" and qty_k:
+                if has_valid_lw and code_part.get(code_k) == "骨架类" and qty_k:
                     bone_rate_total += qty_k / lw_day
             inc_map = {}
             removed_map = {}
             detail_rows = []
+            fallback_warnings = []
             for _, row in grouped.iterrows():
                 restore_part = row["部位大类"]
                 code_raw = row[code_col]
                 qty = float(row["产量(kg)"]) if pd.notna(row["产量(kg)"]) else 0.0
                 if qty == 0:
                     continue
+                if not has_valid_lw and restore_part != "整鸡类":
+                    continue
                 canon_code = _canon_code_val(code_raw)
                 targets_raw = restore_mapping.get(canon_code, [])
                 if not targets_raw:
                     continue
                 targets = [_unify(t) for t in targets_raw if t]
-                valid_targets = [t for t in targets if rate_dict.get(t, 0) > 0]
+                weights, valid_targets = _select_restore_weight_dict(
+                    targets,
+                    rate_dict if has_valid_lw else missing_lw_whole_chicken_weights,
+                    nearest_valid_weights if not has_valid_lw else None,
+                )
                 if not valid_targets:
+                    if not has_valid_lw and restore_part == "整鸡类":
+                        fallback_warnings.append({"日期": day_value, "物料号": canon_code, "数量": qty})
                     continue
                 use_bone_rule = (restore_part == "骨架类")
-                sum_target_rates = sum(rate_dict[t] for t in valid_targets)
+                sum_target_rates = sum(weights[t] for t in valid_targets)
                 if use_bone_rule:
                     adj_rates = {}
                     for t in valid_targets:
-                        adj_rate = rate_dict[t]
+                        adj_rate = weights[t]
                         if t == "骨架类":
                             adj_rate = adj_rate - bone_rate_total
                         if adj_rate > 0:
@@ -4753,7 +4895,7 @@ try:
                                 "物料号": code_raw,
                                 "源产量(kg)": qty,
                                 "目标部位": t,
-                                "目标产成率(%)": rate_dict[t] * 100.0,
+                                "目标产成率(%)": weights[t] * 100.0 if has_valid_lw else np.nan,
                                 "分配比例(%)": share * 100.0,
                                 "增量(kg)": inc
                             })
@@ -4764,7 +4906,7 @@ try:
                 removed_map[restore_part] = removed_map.get(restore_part, 0.0) + qty
                 base_qty = qty / total_rate
                 for t in valid_targets:
-                    rate_val = rate_dict[t]
+                    rate_val = weights[t]
                     share = rate_val / total_rate
                     inc = base_qty * rate_val
                     inc_map[t] = inc_map.get(t, 0.0) + inc
@@ -4774,11 +4916,11 @@ try:
                             "物料号": code_raw,
                             "源产量(kg)": qty,
                             "目标部位": t,
-                            "目标产成率(%)": rate_dict[t] * 100.0,
+                            "目标产成率(%)": weights[t] * 100.0 if has_valid_lw else np.nan,
                             "分配比例(%)": share * 100.0,
                             "增量(kg)": inc
                         })
-            return inc_map, removed_map, detail_rows, lw_day, ov_day, []
+            return inc_map, removed_map, detail_rows, lw_day, ov_day, fallback_warnings
 
         month_start = pd.Timestamp(ref_day).normalize().replace(day=1)
         days_range = [d for d in _all_days if pd.Timestamp(d) >= month_start and pd.Timestamp(d) <= ref_day]
@@ -4883,12 +5025,37 @@ try:
             # 累计映射的调整量
             inc_month = {}
             removed_month = {}
+            fallback_warnings_month = []
+            month_restore_weights = _build_restore_period_weight_dict(overview, month_start, ref_day)
             for d in days_range:
-                inc_d, rem_d, _, _, _, _ = _calc_for_day(d, need_detail=False)
+                day_ts = pd.Timestamp(d).normalize()
+                nearest_weights = _build_nearest_valid_restore_weight_dict(
+                    overview,
+                    df_lw,
+                    day_ts,
+                    month_start,
+                    ref_day,
+                )
+                inc_d, rem_d, _, _, _, fallback_warnings = _calc_for_day(
+                    day_ts,
+                    need_detail=False,
+                    allow_missing_lw_whole_chicken=True,
+                    missing_lw_whole_chicken_weights=month_restore_weights,
+                    nearest_valid_weights=nearest_weights,
+                )
                 for k, v in inc_d.items():
                     inc_month[k] = inc_month.get(k, 0.0) + float(v)
                 for k, v in rem_d.items():
                     removed_month[k] = removed_month.get(k, 0.0) + float(v)
+                fallback_warnings_month.extend(fallback_warnings)
+
+            if fallback_warnings_month:
+                warning_rows = [
+                    f"{pd.Timestamp(item['日期']).strftime('%Y-%m-%d')} {item['物料号']} ({float(item['数量']):.2f}kg)"
+                    for item in fallback_warnings_month[:10]
+                ]
+                more = f"；另有 {len(fallback_warnings_month) - 10} 条" if len(fallback_warnings_month) > 10 else ""
+                st.warning("月累计整鸡还原缺少可用的目标部位结构，已保留原量：" + "；".join(warning_rows) + more)
 
             if not over_month.empty:
                 month_base = over_month.groupby("项目", as_index=False)["产量(kg)"].sum()
