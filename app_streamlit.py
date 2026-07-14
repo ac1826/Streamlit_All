@@ -1133,6 +1133,41 @@ def _apply_row_min_max_highlight(ws, col_start, col_end, data_start_row, data_en
                 cell.fill = min_fill
 
 
+def _center_trend_dash_cells(ws, col_start, col_end, data_start_row, data_end_row):
+    if ws is None or data_end_row < data_start_row or col_end < col_start:
+        return
+
+    center = Alignment(horizontal="center", vertical="center")
+    for row_idx in range(data_start_row, data_end_row + 1):
+        for col_idx in range(col_start, col_end + 1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            if str(cell.value).strip() in {"—", "-"}:
+                cell.alignment = center
+
+
+def _add_trend_month_cumulative(df, month_cumulative, value_col):
+    if df is None or getattr(df, "empty", True):
+        return df
+
+    out = df.copy()
+    out.insert(1, "月累计", np.nan)
+    if (
+        month_cumulative is None
+        or getattr(month_cumulative, "empty", True)
+        or "项目" not in month_cumulative.columns
+        or value_col not in month_cumulative.columns
+    ):
+        return out
+
+    project_col = out.columns[0]
+    values = month_cumulative[["项目", value_col]].copy()
+    values["项目"] = values["项目"].astype(str).str.strip()
+    values[value_col] = pd.to_numeric(values[value_col], errors="coerce")
+    value_map = values.drop_duplicates("项目", keep="last").set_index("项目")[value_col]
+    out["月累计"] = out[project_col].astype(str).str.strip().map(value_map)
+    return out
+
+
 def _get_valid_liveweight_days(df_lw):
     if df_lw is None or getattr(df_lw, "empty", True):
         return set()
@@ -5035,6 +5070,8 @@ try:
                         trend_rate = rate_pivot.reset_index().rename(columns={"项目":"产成率"})
                         trend_price = _mark_trend_missing_liveweight_days(trend_price, days_in_range, df_lw)
                         trend_rate = _mark_trend_missing_liveweight_days(trend_rate, days_in_range, df_lw)
+                        trend_price = _add_trend_month_cumulative(trend_price, export_month_cum, "含税单价")
+                        trend_rate = _add_trend_month_cumulative(trend_rate, export_month_cum, "产成率%")
 
             if (trend_price is not None and not trend_price.empty) or (trend_rate is not None and not trend_rate.empty):
                 trend_sheet = "本月趋势"
@@ -5051,7 +5088,14 @@ try:
                     )
                     _apply_row_min_max_highlight(
                         ws=ws_t,
-                        col_start=2,
+                        col_start=3,
+                        col_end=len(trend_price.columns),
+                        data_start_row=2,
+                        data_end_row=1 + len(trend_price),
+                    )
+                    _center_trend_dash_cells(
+                        ws=ws_t,
+                        col_start=3,
                         col_end=len(trend_price.columns),
                         data_start_row=2,
                         data_end_row=1 + len(trend_price),
@@ -5072,7 +5116,14 @@ try:
                     )
                     _apply_row_min_max_highlight(
                         ws=ws_t,
-                        col_start=2,
+                        col_start=3,
+                        col_end=len(trend_rate.columns),
+                        data_start_row=start_row_trend + 2,
+                        data_end_row=start_row_trend + 1 + len(trend_rate),
+                    )
+                    _center_trend_dash_cells(
+                        ws=ws_t,
+                        col_start=3,
                         col_end=len(trend_rate.columns),
                         data_start_row=start_row_trend + 2,
                         data_end_row=start_row_trend + 1 + len(trend_rate),

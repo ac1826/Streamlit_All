@@ -12,6 +12,71 @@ def _fill_rgb(cell):
     return color.rgb or color.indexed or color.theme
 
 
+def test_add_trend_month_cumulative_uses_existing_month_summary_values():
+    ns = load_calculation_namespace()
+    month_cumulative = pd.DataFrame(
+        {
+            "项目": ["腿类", "胸类"],
+            "含税单价": [12.5, 18.25],
+            "产成率%": [21.5, 17.75],
+        }
+    )
+    trend_price = pd.DataFrame({"含税单价": ["腿类", "胸类"], "5月1日": [12.0, 18.0]})
+    trend_rate = pd.DataFrame({"产成率": ["腿类", "胸类"], "5月1日": [21.0, 17.0]})
+
+    price_out = ns["_add_trend_month_cumulative"](trend_price, month_cumulative, "含税单价")
+    rate_out = ns["_add_trend_month_cumulative"](trend_rate, month_cumulative, "产成率%")
+
+    assert price_out.columns.tolist() == ["含税单价", "月累计", "5月1日"]
+    assert rate_out.columns.tolist() == ["产成率", "月累计", "5月1日"]
+    assert price_out["月累计"].tolist() == [12.5, 18.25]
+    assert rate_out["月累计"].tolist() == [21.5, 17.75]
+
+
+def test_month_cumulative_column_is_excluded_from_daily_highlight():
+    ns = load_calculation_namespace()
+    wb = Workbook()
+    ws = wb.active
+
+    ws.append(["含税单价", "月累计", "5月1日", "5月2日"])
+    ws.append(["腿类", 100.0, 10.0, 20.0])
+
+    ns["_apply_row_min_max_highlight"](
+        ws=ws,
+        col_start=3,
+        col_end=4,
+        data_start_row=2,
+        data_end_row=2,
+    )
+
+    assert _fill_rgb(ws.cell(2, 2)) is None
+    assert _fill_rgb(ws.cell(2, 3)) == ns["TREND_MIN_FILL_COLOR"]
+    assert _fill_rgb(ws.cell(2, 4)) == ns["TREND_MAX_FILL_COLOR"]
+
+
+def test_center_trend_dash_cells_only_centers_dash_values():
+    ns = load_calculation_namespace()
+    wb = Workbook()
+    ws = wb.active
+
+    ws.append(["含税单价", "5月1日", "5月2日", "5月3日"])
+    ws.append(["腿类", 10.0, "—", 20.0])
+    ws.append(["胸类", "-", 15.0, None])
+
+    ns["_center_trend_dash_cells"](
+        ws=ws,
+        col_start=2,
+        col_end=4,
+        data_start_row=2,
+        data_end_row=3,
+    )
+
+    assert ws.cell(2, 3).alignment.horizontal == "center"
+    assert ws.cell(3, 2).alignment.horizontal == "center"
+    assert ws.cell(2, 2).alignment.horizontal is None
+    assert ws.cell(2, 4).alignment.horizontal is None
+
+
 def test_apply_row_min_max_highlight_marks_numeric_extremes_per_row():
     ns = load_calculation_namespace()
     wb = Workbook()
