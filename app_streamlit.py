@@ -5018,40 +5018,95 @@ try:
         except Exception:
             pass
 
-        # —— 月累计：本月起至所选日，叠加各日调整 —— #
+        # —— 月累计：本月起至所选日，按月累计权重一次性分配 —— #
         try:
             month_mask = (overview["日期"] >= month_start) & (overview["日期"] <= ref_day)
             over_month = overview.loc[month_mask].copy()
-            # 累计映射的调整量
+            # 月累计权重直接来自月初至选定日的各部位累计产量。
+            # 当日还原仍走上面的 _calc_for_day，不受这里的月累计口径影响。
             inc_month = {}
             removed_month = {}
             fallback_warnings_month = []
             month_restore_weights = _build_restore_period_weight_dict(overview, month_start, ref_day)
-            for d in days_range:
-                day_ts = pd.Timestamp(d).normalize()
-                nearest_weights = _build_nearest_valid_restore_weight_dict(
-                    overview,
-                    df_lw,
-                    day_ts,
-                    month_start,
-                    ref_day,
-                )
-                inc_d, rem_d, _, _, _, fallback_warnings = _calc_for_day(
-                    day_ts,
-                    need_detail=False,
-                    allow_missing_lw_whole_chicken=True,
-                    missing_lw_whole_chicken_weights=month_restore_weights,
-                    nearest_valid_weights=nearest_weights,
-                )
-                for k, v in inc_d.items():
-                    inc_month[k] = inc_month.get(k, 0.0) + float(v)
-                for k, v in rem_d.items():
-                    removed_month[k] = removed_month.get(k, 0.0) + float(v)
-                fallback_warnings_month.extend(fallback_warnings)
+
+            # 汇总月累计期间的整鸡物料净产量，再按同一套月累计权重一次性分配。
+            # 这样某一天目标部位为负数时，不会阻止该天的整鸡数量使用月累计结构。
+            month_whole_qty = {}
+            month_whole_dates = {}
+            try:
+                if minors is not None and not minors.empty:
+                    minors_month = minors.copy()
+                    minors_month["_restore_date"] = pd.to_datetime(
+                        minors_month["日期"], errors="coerce"
+                    ).dt.normalize()
+                    minors_month = minors_month.loc[
+                        (minors_month["_restore_date"] >= month_start)
+                        & (minors_month["_restore_date"] <= ref_day)
+                    ].copy()
+                    code_col_month = "子类" if "子类" in minors_month.columns else None
+                    if code_col_month is None:
+                        for cand in ["品项", "物料号", "名称", "物料"]:
+                            if cand in minors_month.columns:
+                                code_col_month = cand
+                                break
+                    if code_col_month is not None and not minors_month.empty:
+                        minors_month[code_col_month] = minors_month[code_col_month].astype(str).str.strip()
+                        minors_month["部位大类"] = minors_month["部位大类"].map(_unify)
+                        whole_month = minors_month.loc[
+                            minors_month["部位大类"] == "整鸡类"
+                        ].copy()
+                        if not whole_month.empty:
+                            grouped_whole = whole_month.groupby(code_col_month, as_index=False).agg(
+                                {"产量(kg)": "sum", "_restore_date": "min"}
+                            )
+                            for _, whole_row in grouped_whole.iterrows():
+                                code_raw = whole_row[code_col_month]
+                                canon_code = _canon_code_val(code_raw)
+                                qty = float(whole_row["产量(kg)"]) if pd.notna(whole_row["产量(kg)"]) else 0.0
+                                if qty == 0:
+                                    continue
+                                month_whole_qty[canon_code] = month_whole_qty.get(canon_code, 0.0) + qty
+                                month_whole_dates[canon_code] = whole_row["_restore_date"]
+            except Exception:
+                month_whole_qty = {}
+                month_whole_dates = {}
+
+            for canon_code, qty in month_whole_qty.items():
+                targets_raw = restore_mapping.get(canon_code, [])
+                if not targets_raw:
+                    fallback_warnings_month.append({
+                        "日期": month_whole_dates.get(canon_code, month_start),
+                        "物料号": canon_code,
+                        "数量": qty,
+                        "原因": "未配置物料还原映射",
+                    })
+                    continue
+                targets = [_unify(t) for t in targets_raw if t]
+                valid_targets = [
+                    target for target in targets
+                    if float(month_restore_weights.get(target, 0.0)) > 0
+                ]
+                if not valid_targets:
+                    fallback_warnings_month.append({
+                        "日期": month_whole_dates.get(canon_code, month_start),
+                        "物料号": canon_code,
+                        "数量": qty,
+                        "原因": "月累计目标部位没有正数权重",
+                    })
+                    continue
+                total_weight = sum(float(month_restore_weights[target]) for target in valid_targets)
+                if total_weight <= 0:
+                    continue
+                removed_month["整鸡类"] = removed_month.get("整鸡类", 0.0) + qty
+                for target in valid_targets:
+                    inc_month[target] = inc_month.get(target, 0.0) + qty * float(
+                        month_restore_weights[target]
+                    ) / total_weight
 
             if fallback_warnings_month:
                 warning_rows = [
-                    f"{pd.Timestamp(item['日期']).strftime('%Y-%m-%d')} {item['物料号']} ({float(item['数量']):.2f}kg)"
+                    f"{pd.Timestamp(item['日期']).strftime('%Y-%m-%d')} {item['物料号']} "
+                    f"({float(item['数量']):.2f}kg，{item.get('原因', '目标部位无有效权重')})"
                     for item in fallback_warnings_month[:10]
                 ]
                 more = f"；另有 {len(fallback_warnings_month) - 10} 条" if len(fallback_warnings_month) > 10 else ""
