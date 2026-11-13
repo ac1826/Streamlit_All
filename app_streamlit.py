@@ -2432,6 +2432,25 @@ def warn_chest_restoration_month_value_issues(detail):
         pass
 
 
+def _project_unit_prices(projects, material_detail, *, daily=False):
+    # 去骨整鸡的金额留在整鸡类报表行，但不参与剩余整鸡的单价计算。
+    amount = projects["含税金额"]
+    qty = projects["产量(kg)"]
+    keys = ["日期", "项目"] if daily else ["项目"]
+    source = material_detail.loc[
+        material_detail["物料号"].eq(EXPORT_BONELESS_CHICKEN_CODE)
+        & material_detail["项目"].eq("整鸡类")
+    ]
+    if source.empty:
+        return amount.div(qty.where(qty.ne(0)))
+    excluded = source.groupby(keys)["含税金额"].sum()
+    if daily:
+        deductions = pd.MultiIndex.from_frame(projects[keys]).map(excluded)
+    else:
+        deductions = projects["项目"].map(excluded)
+    return (amount - deductions.fillna(0.0)).div(qty.where(qty.ne(0)))
+
+
 def build_overview(xls, code2major, df_lw=None, manual_month_df=None, alloc_long=None, chest_cartilage_rules=None):
     # 产量
     qty = read_qty_per_code_per_day(xls)
@@ -2499,7 +2518,7 @@ def build_overview(xls, code2major, df_lw=None, manual_month_df=None, alloc_long
         sales_proj = pd.DataFrame(columns=["日期","项目","销量(kg)"])
 
     over = m_split.groupby(["日期","项目"], as_index=False).agg({"产量(kg)":"sum","含税金额":"sum"})
-    over["含税单价"] = np.where(over["产量(kg)"] != 0, over["含税金额"]/over["产量(kg)"], np.nan)
+    over["含税单价"] = _project_unit_prices(over, m_split, daily=True)
     over["项目"] = pd.Categorical(over["项目"], categories=ORDER, ordered=True)
     over = over.sort_values("项目")
 
@@ -4282,6 +4301,7 @@ else:
 
         # —— 当月产量（已分摊/还原后的子类）× 原物料月均价 → 金额，再按部位汇总 ——
         cum_base = pd.DataFrame()
+        monthly_price_detail = pd.DataFrame(columns=["项目", "物料号", "含税金额"])
         chest_restoration_total_target_amount = np.nan
         try:
             if minors is not None and not minors.empty:
@@ -4325,6 +4345,7 @@ else:
                             "含税金额": s["含税金额"],
                         }]))
                     cum_base = pd.concat(frames, ignore_index=True)
+                    monthly_price_detail = detail
         except Exception:
             cum_base = pd.DataFrame()
 
@@ -4341,7 +4362,7 @@ else:
         cum["产量(kg)"] = pd.to_numeric(cum["产量(kg)"], errors="coerce").fillna(0.0)
         cum["销量(kg)"] = pd.to_numeric(cum["销量(kg)"], errors="coerce").fillna(0.0)
         cum["含税金额"] = pd.to_numeric(cum["含税金额"], errors="coerce").fillna(0.0)
-        cum["含税单价"] = np.where(cum["产量(kg)"] != 0, cum["含税金额"]/cum["产量(kg)"], np.nan)
+        cum["含税单价"] = _project_unit_prices(cum, monthly_price_detail)
 
         # 其它大类（非必显）
         others_c = pd.DataFrame()
