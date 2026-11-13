@@ -120,6 +120,13 @@ SPECIFIED = [
 ORDER = SPECIFIED + ["下料类","其他内脏","鸡头+鸡脖+骨架","总计"]
 BASE_FOR_TOTAL = [x for x in ORDER if x not in ("胸类","鸡头+鸡脖+骨架","总计")]
 MAIN_PRODUCTS = {"腿类", "胸类", "胸类-胸", "胸类-胸皮", "里肌类", "翅类", "爪类"}
+EXPORT_BONELESS_CHICKEN_CODE = "AEC0700331640"
+# 铁岭出口去骨整鸡部位占比（Sheet1）：仅还原产量，金额留在整鸡类。
+EXPORT_BONELESS_CHICKEN_YIELD = {
+    "胸类-胸": 0.4008,
+    "胸类-胸皮": 0.0809,
+    "腿类": 0.5183,
+}
 
 
 def _normalize_project_set(projects):
@@ -2112,6 +2119,13 @@ def build_month_code_detail_with_restoration_value_conservation(
     price = price.dropna(subset=["物料号"]).drop_duplicates("物料号", keep="last")
     detail = detail.merge(price[["物料号", "月均价"]], on="物料号", how="left")
     detail["含税金额"] = detail["月均价"] * detail["产量(kg)"]
+    export_mask = detail["物料号"].eq(EXPORT_BONELESS_CHICKEN_CODE)
+    if export_mask.any():
+        export_rows = detail.loc[export_mask]
+        export_qty = export_rows["产量(kg)"].sum()
+        source_mask = export_mask & detail[part_col].eq("整鸡类")
+        detail.loc[export_mask & ~source_mask, "含税金额"] = 0.0
+        detail.loc[source_mask, "含税金额"] = export_qty * detail.loc[source_mask, "月均价"]
     initial_total_amount = float(_pd.to_numeric(detail["含税金额"], errors="coerce").fillna(0.0).sum())
     target_total_delta = 0.0
 
@@ -2129,7 +2143,7 @@ def build_month_code_detail_with_restoration_value_conservation(
         is_restore_row = work[meta_source_col].fillna("").astype(str).str.strip() != ""
     else:
         is_restore_row = _pd.Series(False, index=work.index)
-    normal_work = work.loc[~is_restore_row].copy()
+    normal_work = work.loc[~is_restore_row & work["物料号"].ne(EXPORT_BONELESS_CHICKEN_CODE)].copy()
     if not normal_work.empty:
         normal_detail = normal_work.groupby([part_col, "物料号"], as_index=False)[["产量(kg)"]].sum(min_count=1)
         normal_detail = normal_detail.merge(price[["物料号", "月均价"]], on="物料号", how="left")
@@ -2347,7 +2361,7 @@ def build_month_code_detail_with_restoration_value_conservation(
             )
             for _, rule in rules.iterrows():
                 source_code = str(rule.get("物料号") or "").strip()
-                if not source_code:
+                if not source_code or source_code == EXPORT_BONELESS_CHICKEN_CODE:
                     continue
                 if source_code in meta_adjusted_sources:
                     continue
@@ -2379,9 +2393,9 @@ def build_month_code_detail_with_restoration_value_conservation(
                 )
 
     detail["月均价"] = _np.where(
-        _pd.to_numeric(detail["产量(kg)"], errors="coerce") != 0,
-        _pd.to_numeric(detail["含税金额"], errors="coerce") / _pd.to_numeric(detail["产量(kg)"], errors="coerce"),
-        _np.nan,
+        detail["物料号"].eq(EXPORT_BONELESS_CHICKEN_CODE) & detail[part_col].eq("整鸡类"),
+        detail["月均价"],
+        _np.where(detail["产量(kg)"] != 0, detail["含税金额"] / detail["产量(kg)"], _np.nan),
     )
     result = detail[out_cols].copy()
     result.attrs["chest_restoration_negative_value_warnings"] = warnings
@@ -2430,7 +2444,9 @@ def build_overview(xls, code2major, df_lw=None, manual_month_df=None, alloc_long
     m = qty.merge(pr_fill, on=["日期","物料号"], how="left")
 
     # << 部位分摊：若命中分摊规则则按比例拆分，否则回落到一对一映射 >>
-    m_split = apply_part_allocation(m, alloc_long, code2major)
+    export_mask = m["物料号"].eq(EXPORT_BONELESS_CHICKEN_CODE)
+    normal_production = m.loc[~export_mask]
+    m_split = apply_part_allocation(normal_production, alloc_long, code2major)
     if chest_cartilage_rules is not None and not getattr(chest_cartilage_rules, "empty", True):
         chest_price_daily = build_chest_cartilage_price_by_date(
             pr_raw,
@@ -2441,11 +2457,15 @@ def build_overview(xls, code2major, df_lw=None, manual_month_df=None, alloc_long
         )
         m_split = apply_chest_cartilage_structure_restoration(
             m_split,
-            m,
+            normal_production,
             chest_cartilage_rules,
             df_lw,
             chest_price_daily,
         )
+
+    if export_mask.any():
+        export_production = m.loc[export_mask, ["日期", "物料号", "产量(kg)", "综合单价_filled"]]
+        m_split = pd.concat([m_split, restore_export_boneless_chicken_yield(export_production)], ignore_index=True)
 
     # 销量（按项目拆分）
     sales_proj = pd.DataFrame(columns=["日期","项目","销量(kg)"])
@@ -3300,6 +3320,7 @@ def _calc_restore_maps_for_day(
         return {}, {}, lw_day, ov_day
 
     minors_day[code_col] = minors_day[code_col].astype(str).str.strip()
+    minors_day = minors_day.loc[minors_day[code_col].ne(EXPORT_BONELESS_CHICKEN_CODE)].copy()
     minors_day["\u90e8\u4f4d\u5927\u7c7b"] = minors_day["\u90e8\u4f4d\u5927\u7c7b"].map(_unify_restore_part)
     grouped = minors_day.groupby(["\u90e8\u4f4d\u5927\u7c7b", code_col], as_index=False)["\u4ea7\u91cf(kg)"].sum()
 
@@ -3435,6 +3456,14 @@ def _compute_restored_main_side_qty_amt_for_period(
         return np.nan, np.nan, np.nan, np.nan
 
     period_proj = base_scope.groupby("项目", as_index=False)[["产量(kg)", "含税金额"]].sum(min_count=1)
+    export_qty_by_part = {}
+    if minors is not None and {"日期", "子类", "部位大类", "产量(kg)"}.issubset(minors.columns):
+        export_rows = minors.loc[
+            minors["子类"].eq(EXPORT_BONELESS_CHICKEN_CODE)
+            & minors["日期"].between(start, end)
+        ]
+        export_qty_by_part = export_rows.groupby("部位大类")["产量(kg)"].sum().to_dict()
+        export_qty_by_part = _combine_restored_qty_map(export_qty_by_part)
     qty_map = {}
     amt_map = {}
     unit_map = {}
@@ -3444,7 +3473,8 @@ def _compute_restored_main_side_qty_amt_for_period(
         amt = float(row["含税金额"]) if pd.notna(row["含税金额"]) else 0.0
         qty_map[proj] = qty
         amt_map[proj] = amt
-        unit_map[proj] = (amt / qty) if qty != 0 else np.nan
+        priced_qty = qty - export_qty_by_part.get(proj, 0.0)
+        unit_map[proj] = amt / priced_qty if priced_qty != 0 else np.nan
 
     period_weights = (
         _build_restore_period_weight_dict(overview, start, end)
@@ -3494,9 +3524,11 @@ def _compute_restored_main_side_qty_amt_for_period(
     for proj in sorted(main_projects):
         unit = unit_map.get(proj, np.nan)
         qty_val = float(restored_qty_map.get(proj, qty_map.get(proj, 0.0)))
-        if pd.notna(unit):
+        if pd.notna(unit) or proj in export_qty_by_part:
             have_main_amt = True
-            main_amt_total += float(unit) * qty_val
+            main_amt_total += amt_map.get(proj, 0.0)
+            if pd.notna(unit):
+                main_amt_total += float(unit) * (qty_val - qty_map.get(proj, 0.0))
     if not have_main_amt:
         main_amt_total = np.nan
 
@@ -3627,6 +3659,19 @@ def _build_main_side_rows(
         row_date = pd.to_datetime(start if start is not None else seg["日期"].iloc[0], errors="coerce")
         rows.insert(0, "日期", row_date)
     return rows
+
+
+def restore_export_boneless_chicken_yield(production):
+    columns = ["日期", "项目", "物料号", "产量(kg)", "含税金额"]
+    source = production.assign(
+        项目="整鸡类",
+        **{"含税金额": production["产量(kg)"] * production["综合单价_filled"], "产量(kg)": 0.0},
+    )
+    parts = [
+        production.assign(项目=part, **{"产量(kg)": production["产量(kg)"] * ratio, "含税金额": 0.0})
+        for part, ratio in EXPORT_BONELESS_CHICKEN_YIELD.items()
+    ]
+    return pd.concat([frame[columns] for frame in [source, *parts]], ignore_index=True)
 
 
 def apply_part_allocation(m_code_daily, alloc_long, code2major):
@@ -4816,6 +4861,7 @@ try:
                 return {}, {}, [], lw_day, ov_day
 
             minors_day[code_col] = minors_day[code_col].astype(str).str.strip()
+            minors_day = minors_day.loc[minors_day[code_col].ne(EXPORT_BONELESS_CHICKEN_CODE)]
             grouped = minors_day.groupby(["部位大类", code_col], as_index=False)["产量(kg)"].sum()
             code_qty = {}
             code_part = {}
