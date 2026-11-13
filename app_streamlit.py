@@ -3246,6 +3246,24 @@ def _build_restore_period_weight_dict(overview, start, end):
         return {}
 
 
+def _exclude_fixed_yield_from_restore_weights(overview, minors):
+    if minors is None or not {"日期", "子类", "部位大类", "产量(kg)"}.issubset(minors.columns):
+        return overview
+    fixed = minors.loc[
+        minors["子类"].eq(EXPORT_BONELESS_CHICKEN_CODE)
+        & minors["部位大类"].isin(EXPORT_BONELESS_CHICKEN_YIELD),
+        ["日期", "部位大类", "产量(kg)"],
+    ].rename(columns={"部位大类": "项目"})
+    if fixed.empty:
+        return overview
+    chest = fixed.loc[fixed["项目"].isin(["胸类-胸", "胸类-胸皮"])].assign(项目="胸类")
+    deductions = pd.concat([fixed, chest]).groupby(["日期", "项目"])["产量(kg)"].sum()
+    weight_base = overview.copy()
+    deduction = pd.MultiIndex.from_frame(weight_base[["日期", "项目"]]).map(deductions)
+    weight_base["产量(kg)"] -= deduction.fillna(0.0)
+    return weight_base
+
+
 def _build_nearest_valid_restore_weight_dict(overview, df_lw, day_value, start, end):
     if overview is None or getattr(overview, "empty", True):
         return {}
@@ -3285,6 +3303,7 @@ def _calc_restore_maps_for_day(
     restore_mapping,
     missing_lw_whole_chicken_weights=None,
     nearest_valid_weights=None,
+    weight_overview=None,
 ):
     ov_day = overview[overview["\u65e5\u671f"] == day_value][["\u9879\u76ee", "\u4ea7\u91cf(kg)", "\u542b\u7a0e\u91d1\u989d", "\u542b\u7a0e\u5355\u4ef7"]].copy()
     if ov_day.empty:
@@ -3296,7 +3315,11 @@ def _calc_restore_maps_for_day(
     if not has_valid_lw and not (missing_lw_whole_chicken_weights or nearest_valid_weights):
         return {}, {}, lw_day, ov_day
 
-    rate_dict = _build_restore_rate_dict(ov_day, lw_day) if has_valid_lw else {}
+    if weight_overview is None:
+        weight_overview = _exclude_fixed_yield_from_restore_weights(overview, minors)
+    weight_day = weight_overview.loc[weight_overview["日期"].eq(day_value), ["项目", "产量(kg)"]].copy()
+    weight_day["项目"] = weight_day["项目"].map(_unify_restore_part)
+    rate_dict = _build_restore_rate_dict(weight_day, lw_day) if has_valid_lw else {}
     if has_valid_lw and not rate_dict:
         return {}, {}, lw_day, ov_day
     if minors is None or minors.empty or not restore_mapping:
@@ -3476,8 +3499,9 @@ def _compute_restored_main_side_qty_amt_for_period(
         priced_qty = qty - export_qty_by_part.get(proj, 0.0)
         unit_map[proj] = amt / priced_qty if priced_qty != 0 else np.nan
 
+    weight_overview = _exclude_fixed_yield_from_restore_weights(overview, minors)
     period_weights = (
-        _build_restore_period_weight_dict(overview, start, end)
+        _build_restore_period_weight_dict(weight_overview, start, end)
         if allow_missing_lw_whole_chicken
         else {}
     )
@@ -3485,7 +3509,7 @@ def _compute_restored_main_side_qty_amt_for_period(
     for day_value in sorted(base_scope["日期"].dropna().unique()):
         day_ts = pd.Timestamp(day_value).normalize()
         nearest_weights = (
-            _build_nearest_valid_restore_weight_dict(overview, df_lw, day_ts, start, end)
+            _build_nearest_valid_restore_weight_dict(weight_overview, df_lw, day_ts, start, end)
             if allow_missing_lw_whole_chicken
             else {}
         )
@@ -3497,6 +3521,7 @@ def _compute_restored_main_side_qty_amt_for_period(
             restore_mapping,
             missing_lw_whole_chicken_weights=period_weights,
             nearest_valid_weights=nearest_weights,
+            weight_overview=weight_overview,
         )
         if ov_day is None or ov_day.empty:
             continue
@@ -4789,9 +4814,15 @@ try:
         if restore_mapping_file is not None:
             msg = f"已读取 {len(restore_mapping)} 个物料号的还原去向。" if restore_mapping else "未在映射表中识别到有效的列/数据。"
             st.caption(msg)
-        if not restore_mapping:
+        has_fixed_yield = (
+            minors is not None
+            and "子类" in minors.columns
+            and minors["子类"].eq(EXPORT_BONELESS_CHICKEN_CODE).any()
+        )
+        if not restore_mapping and not has_fixed_yield:
             st.warning("请上传包含“物料号→目标部位”的映射表后再继续。")
             st.stop()
+        weight_overview = _exclude_fixed_yield_from_restore_weights(overview, minors)
 
         def _canon_code_val(v):
             normed = normalize_code([v])
@@ -4812,15 +4843,6 @@ try:
                 val = float("nan")
             return val
 
-        def _build_rate_dict(ov_slice, lw_value):
-            rate_df = (ov_slice
-                       .groupby("项目", as_index=False)["产量(kg)"].sum())
-            if rate_df.empty or not (pd.notna(lw_value) and lw_value > 0):
-                return {}
-            rate_df["产成率(小数)"] = rate_df["产量(kg)"] / lw_value
-            return {row["项目"]: row["产成率(小数)"] for _, row in rate_df.iterrows()
-                    if pd.notna(row["产成率(小数)"]) and row["产成率(小数)"] > 0}
-
         def _calc_for_day(
             day_value,
             need_detail=False,
@@ -4836,7 +4858,9 @@ try:
             has_valid_lw = pd.notna(lw_day) and float(lw_day) > 0
             if not has_valid_lw and not allow_missing_lw_whole_chicken:
                 return {}, {}, [], lw_day, ov_day, []
-            rate_dict = _build_rate_dict(ov_day, lw_day) if has_valid_lw else {}
+            weight_day = weight_overview.loc[weight_overview["日期"].eq(day_value), ["项目", "产量(kg)"]].copy()
+            weight_day["项目"] = weight_day["项目"].map(_unify)
+            rate_dict = _build_restore_rate_dict(weight_day, lw_day) if has_valid_lw else {}
             if has_valid_lw and not rate_dict:
                 return {}, {}, [], lw_day, ov_day, []
 
@@ -5056,6 +5080,25 @@ try:
 
         # —— 当日物料号还原明细（下钻） —— #
         try:
+            if has_fixed_yield:
+                fixed_day = minors.loc[
+                    minors["日期"].eq(ref_day)
+                    & minors["子类"].eq(EXPORT_BONELESS_CHICKEN_CODE)
+                    & minors["部位大类"].isin(EXPORT_BONELESS_CHICKEN_YIELD)
+                ]
+                fixed_qty = fixed_day["产量(kg)"].sum()
+                if fixed_qty != 0:
+                    for part, part_qty in fixed_day.groupby("部位大类")["产量(kg)"].sum().items():
+                        detail_ref.append({
+                            "日期": ref_day,
+                            "物料号": EXPORT_BONELESS_CHICKEN_CODE,
+                            "源产量(kg)": fixed_qty,
+                            "目标部位": part,
+                            "目标产成率(%)": np.nan,
+                            "分配比例(%)": EXPORT_BONELESS_CHICKEN_YIELD[part] * 100,
+                            "增量(kg)": part_qty,
+                            "还原方式": "固定比例（已计入原产量）",
+                        })
             if detail_ref:
                 detail_df = pd.DataFrame(detail_ref)
                 if not detail_df.empty:
@@ -5073,7 +5116,7 @@ try:
             inc_month = {}
             removed_month = {}
             fallback_warnings_month = []
-            month_restore_weights = _build_restore_period_weight_dict(overview, month_start, ref_day)
+            month_restore_weights = _build_restore_period_weight_dict(weight_overview, month_start, ref_day)
 
             # 汇总月累计期间的整鸡物料净产量，再按同一套月累计权重一次性分配。
             # 这样某一天目标部位为负数时，不会阻止该天的整鸡数量使用月累计结构。
