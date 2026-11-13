@@ -2463,13 +2463,28 @@ def _show_export_chicken_before_restoration(summary, material_detail):
     total_qty = qty_by_part.sum()
     chest_qty = qty_by_part.get("胸类-胸", 0.0) + qty_by_part.get("胸类-胸皮", 0.0)
     qty_delta = {part: -qty for part, qty in qty_by_part.items()}
-    qty_delta.update({"胸类": -chest_qty, "整鸡类": total_qty, "主产品": -total_qty, "副产品": total_qty})
+    qty_delta.update({"胸类": -chest_qty, "整鸡类": total_qty})
     out = summary.copy()
     out["产量(kg)"] += out["项目"].map(qty_delta).fillna(0.0)
 
     part_mask = out["项目"].isin([*EXPORT_BONELESS_CHICKEN_YIELD, "胸类", "整鸡类"])
     qty = out.loc[part_mask, "产量(kg)"]
     out.loc[part_mask, "含税单价"] = out.loc[part_mask, "含税金额"].div(qty.where(qty.ne(0)))
+
+    # 汇总行按主产品归类，整鸡明细按物料归类；金额只在主副产品之间转移。
+    export_amount = material_detail.loc[
+        material_detail["物料号"].eq(EXPORT_BONELESS_CHICKEN_CODE)
+        & material_detail["项目"].eq("整鸡类"),
+        "含税金额",
+    ].sum()
+    totals = out.loc[out["项目"].eq("总计"), "产量(kg)"]
+    if not totals.empty:
+        for project, delta in (("主产品", export_amount), ("副产品", -export_amount)):
+            mask = out["项目"].eq(project)
+            out.loc[mask, "含税金额"] += delta
+            out.loc[mask, "含税单价"] = out.loc[mask, "含税金额"].map(
+                lambda amount: _component_value_unit(totals.iloc[0], amount)
+            )
     return out
 
 
