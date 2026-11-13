@@ -2451,6 +2451,28 @@ def _project_unit_prices(projects, material_detail, *, daily=False):
     return (amount - deductions.fillna(0.0)).div(qty.where(qty.ne(0)))
 
 
+def _show_export_chicken_before_restoration(summary, material_detail):
+    fixed = material_detail.loc[
+        material_detail["物料号"].eq(EXPORT_BONELESS_CHICKEN_CODE)
+        & material_detail["项目"].isin(EXPORT_BONELESS_CHICKEN_YIELD)
+    ]
+    if fixed.empty:
+        return summary
+
+    qty_by_part = fixed.groupby("项目")["产量(kg)"].sum()
+    total_qty = qty_by_part.sum()
+    chest_qty = qty_by_part.get("胸类-胸", 0.0) + qty_by_part.get("胸类-胸皮", 0.0)
+    qty_delta = {part: -qty for part, qty in qty_by_part.items()}
+    qty_delta.update({"胸类": -chest_qty, "整鸡类": total_qty, "主产品": -total_qty, "副产品": total_qty})
+    out = summary.copy()
+    out["产量(kg)"] += out["项目"].map(qty_delta).fillna(0.0)
+
+    part_mask = out["项目"].isin([*EXPORT_BONELESS_CHICKEN_YIELD, "胸类", "整鸡类"])
+    qty = out.loc[part_mask, "产量(kg)"]
+    out.loc[part_mask, "含税单价"] = out.loc[part_mask, "含税金额"].div(qty.where(qty.ne(0)))
+    return out
+
+
 def build_overview(xls, code2major, df_lw=None, manual_month_df=None, alloc_long=None, chest_cartilage_rules=None):
     # 产量
     qty = read_qty_per_code_per_day(xls)
@@ -3799,6 +3821,7 @@ def build_overview_table_for_day(
     round_values=True,
     minors=None,
     restore_mapping=None,
+    show_export_chicken_before_restoration=False,
 ):
     """构造指定日期的“总览”展示表（含胸类合并、总计、产成率显示）。"""
     import pandas as pd, numpy as np
@@ -3881,6 +3904,11 @@ def build_overview_table_for_day(
         "产成率%": [np.nan],
     })
     final_ov = pd.concat([base_today, main_side_rows, total_row], ignore_index=True)
+    if show_export_chicken_before_restoration and minors is not None and not minors.empty:
+        daily_detail = minors.loc[minors["日期"].eq(sel_dt)].rename(
+            columns={"子类": "物料号", "部位大类": "项目"}
+        )
+        final_ov = _show_export_chicken_before_restoration(final_ov, daily_detail)
     disp = _attach_rate_display(final_ov, df_lw).copy()
     for _c in ["产量(kg)","销量(kg)","产成率%","含税金额","含税单价"]:
         if _c in disp.columns:
@@ -4172,6 +4200,7 @@ else:
         round_values=True,
         minors=minors,
         restore_mapping=restore_mapping_state,
+        show_export_chicken_before_restoration=True,
     )
     export_daily_src = build_overview_table_for_day(
         overview,
@@ -4182,6 +4211,7 @@ else:
         round_values=False,
         minors=minors,
         restore_mapping=restore_mapping_state,
+        show_export_chicken_before_restoration=True,
     )
     export_daily_overview = add_sale_rate(export_daily_src) if export_daily_src is not None else pd.DataFrame()
     if export_daily_overview is not None and not export_daily_overview.empty:
@@ -4301,7 +4331,7 @@ else:
 
         # —— 当月产量（已分摊/还原后的子类）× 原物料月均价 → 金额，再按部位汇总 ——
         cum_base = pd.DataFrame()
-        monthly_price_detail = pd.DataFrame(columns=["项目", "物料号", "含税金额"])
+        monthly_price_detail = pd.DataFrame(columns=["项目", "物料号", "含税金额", "产量(kg)"])
         chest_restoration_total_target_amount = np.nan
         try:
             if minors is not None and not minors.empty:
@@ -4419,6 +4449,7 @@ else:
         )
         total_row = pd.DataFrame({"项目":["总计"],                               "产量(kg)":[float(tot_qty) if pd.notna(tot_qty) else 0.0],                               "销量(kg)":[float(tot_sale) if pd.notna(tot_sale) else 0.0],                               "含税金额":[float(tot_amt) if pd.notna(tot_amt) else 0.0],                               "含税单价":[float(tot_unit)]})
         cum_final = pd.concat([cum_base, main_side_rows, total_row], ignore_index=True)
+        cum_final = _show_export_chicken_before_restoration(cum_final, monthly_price_detail)
 
         # 可选：累计产成率（以本月毛鸡净重累计为分母）
         try:
@@ -5370,6 +5401,7 @@ try:
                             round_values=False,
                             minors=minors,
                             restore_mapping=restore_mapping_state,
+                            show_export_chicken_before_restoration=True,
                         )
                         if day_df is None or day_df.empty:
                             continue
